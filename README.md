@@ -1,6 +1,9 @@
-# Stellabill Contracts
+# Stellabill Contracts ....
+
 
 Soroban smart contracts for **Stellabill** — prepaid USDC subscription billing on the Stellar network. This repository contains the on-chain logic for recurring payments, subscriber vaults, and merchant payouts.
+
+For a runnable off-chain example, see the [reference event indexer](docs/indexer_reference.md), which captures Soroban contract events in a local SQLite database.
 
 ---
 
@@ -154,7 +157,6 @@ The installer is **idempotent** — safe to run repeatedly. It:
 1. Sets the executable bit on all scripts under `.githooks/`.
 2. Runs `git config core.hooksPath .githooks` (no global config changes).
 3. Smoke-tests the hook to confirm it exits 0.
-
 After installation, every `git commit` automatically runs:
 
 | Check | Command | Scope |
@@ -212,6 +214,23 @@ The script creates three test identities (`admin`, `subscriber`, `merchant`),
 wraps the native Stellar asset as a test token, and validates the deployment
 by creating, funding, and charging a subscription.
 
+### Error table generation
+
+[`scripts/generate_error_table.py`](scripts/generate_error_table.py) is a code-generation utility that produces the canonical error-code cross-reference table by:
+
+1. Parsing `contracts/subscription_vault/src/types.rs` to extract error variants and numeric codes.
+2. Grepping all `.rs` source files to identify which contract entrypoints emit each error.
+3. Splicing the generated table into the "## Entrypoint Cross-Reference" section of [`docs/errors.md`](docs/errors.md).
+
+**Usage:**
+
+```bash
+python scripts/generate_error_table.py       # Generate and update docs/errors.md in-place
+python scripts/generate_error_table.py --check # Check mode: fail if docs/errors.md would change (used by CI)
+```
+
+The generator is deterministic; when run without changes to the error enum or emitting code, it produces no output diff. The generated table is committed to the repository as the single source of truth for error codes and recommended client retry handling.
+
 ---
 
 ## Contributing (open source)
@@ -247,6 +266,20 @@ We welcome contributions from the community. Here’s how to get started and how
 - **Rust**: Follow common Rust style (`cargo fmt`, `cargo clippy`). No `unwrap()` in contract logic without a clear justification; prefer `Result` and explicit errors.
 - **Soroban**: Use `Env` for storage and auth; keep contract functions narrow and well-documented.
 - **Security**: Any change that touches auth, token transfers, or admin rights will get extra review. When in doubt, open an issue first.
+
+### Oracle governance and security
+
+The contract implements **oracle-gated governance** to prevent price-manipulation attacks:
+
+- **Oracle address changes require quorum-based governance approval** via `submit_proposal(ProposalKind::SetOracleConfig, ...)` and guardian voting, not immediate admin action. A malicious admin cannot redirect price feeds without a 2+ day timelock and supermajority (67%) guardian support.
+- **Other oracle parameters** (max_age, pricing kind, deviation threshold) can be updated via direct admin call with the standard 6-hour CONFIG_COOLDOWN, since they do not expose the contract to price manipulation.
+- The governance system enforces a minimum 2-day timelock (`MIN_TIMELOCK_DELAY`) and 67% quorum (`MIN_QUORUM_BPS`) on all SetOracleConfig proposals.
+
+When modifying oracle-related code, ensure:
+1. Oracle address changes go through `submit_proposal` + `execute_proposal`, never direct admin updates.
+2. Non-address oracle config updates use the cooldown-protected path (`set_oracle_config_except_address`).
+3. All new oracle proposal types are added to the `ProposalKind` enum and validated in `validate_proposal_config`.
+4. Tests confirm that oracle address changes are rejected with `Error::GovernanceRequired` when attempted via direct admin call.
 
 ### Getting help
 

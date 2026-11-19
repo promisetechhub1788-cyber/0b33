@@ -44,7 +44,7 @@ pub trait OracleAdapter {
     /// - [`Error::OracleNotConfigured`]   — oracle address is absent when required.
     /// - [`Error::OraclePriceUnavailable`] — no price data is available.
     /// - [`Error::OraclePriceStale`]       — available data exceeds `max_age_seconds`.
-    /// - [`Error::OraclePriceInvalid`]     — returned price is non-positive.
+    /// - [`Error::OraclePriceInvalid`]     — returned price is non-positive or outside sanity band.
     /// - [`Error::InvalidInput`]           — adapter configuration is invalid.
     fn quote(
         env: &Env,
@@ -80,7 +80,7 @@ impl OracleAdapter for SpotAdapter {
                 soroban_sdk::Vec::new(env),
             );
 
-        validate_price(env, &price, config.max_age_seconds)
+        validate_price(env, &price, config)
     }
 }
 
@@ -142,7 +142,9 @@ impl OracleAdapter for TwapAdapter {
             return Err(Error::OraclePriceStale);
         }
 
-        Ok(median(&mut prices))
+        let median_price = median(&mut prices);
+        validate_sanity_band(env, &median_price, config)?;
+        Ok(median_price)
     }
 }
 
@@ -190,27 +192,43 @@ impl OracleAdapter for FixedRateAdapter {
         if config.fixed_denominator == 0 {
             return Err(Error::InvalidInput);
         }
-        Ok((config.fixed_numerator * PRICE_SCALE) / config.fixed_denominator)
+        let price = (config.fixed_numerator * PRICE_SCALE) / config.fixed_denominator;
+        validate_sanity_band(_env, &price, config)?;
+        Ok(price)
     }
 }
 
 // ── Validation helpers ────────────────────────────────────────────────────────
 
-/// Validate a single [`OraclePrice`] observation against the staleness threshold.
+/// Validate a single [`OraclePrice`] observation against the staleness threshold
+/// and sanity band.
 pub fn validate_price(
     env: &Env,
     price: &OraclePrice,
-    max_age_seconds: u64,
+    config: &OracleConfig,
 ) -> Result<u128, Error> {
     if price.price <= 0 {
         return Err(Error::OraclePriceInvalid);
     }
     let now = env.ledger().timestamp();
     let age = now.saturating_sub(price.timestamp);
-    if age > max_age_seconds {
+    if age > config.max_age_seconds {
         return Err(Error::OraclePriceStale);
     }
-    Ok(price.price as u128)
+    let price_u128 = price.price as u128;
+    validate_sanity_band(env, &price_u128, config)?;
+    Ok(price_u128)
+}
+
+/// Validate that a resolved price is strictly positive.
+///
+/// `OracleConfig` does not currently carry absolute price bounds, so the
+/// positive-price invariant is the sanity check every adapter can enforce.
+fn validate_sanity_band(_env: &Env, price: &u128, _config: &OracleConfig) -> Result<(), Error> {
+    if *price == 0 {
+        return Err(Error::OraclePriceInvalid);
+    }
+    Ok(())
 }
 
 // ── Central dispatch ──────────────────────────────────────────────────────────

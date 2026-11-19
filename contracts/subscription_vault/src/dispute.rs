@@ -1,15 +1,15 @@
-//! Dispute / chargeback workflow for contested subscription charges.
+﻿//! Dispute / chargeback workflow for contested subscription charges.
 //!
 //! Provides a two-step dispute workflow (open_dispute, respond_dispute,
 //! resolve_dispute) that mirrors payment-card chargeback semantics.
 //!
 //! # Flow
 //!
-//! 1. **Subscriber opens a dispute** – the disputed amount is moved from the
+//! 1. **Subscriber opens a dispute** ΓÇô the disputed amount is moved from the
 //!    merchant's balance into a [`DataKey::DisputeEscrow(u64)`] bucket.
-//! 2. **Admin responds** (optional) – during the [`DISPUTE_WINDOW_SECS`] window the
+//! 2. **Admin responds** (optional) ΓÇô during the [`DISPUTE_WINDOW_SECS`] window the
 //!    admin may respond with evidence, moving the dispute to `Responded` status.
-//! 3. **Admin resolves** – after a response (or after the window elapses) the admin
+//! 3. **Admin resolves** ΓÇô after a response (or after the window elapses) the admin
 //!    routes the escrowed funds to either the subscriber or the merchant.
 //!
 //! # Security
@@ -28,7 +28,7 @@ use crate::queries;
 use crate::types::{
     CancellationEscrow, CancellationEscrowDisputedEvent, CancellationEscrowReleasedEvent, DataKey,
     Dispute, DisputeEscrowLedger, DisputeOpenedEvent, DisputeResolvedEvent,
-    DisputeRespondedEvent, DisputeStatus, Error, DISPUTE_WINDOW_SECS,
+    DisputeRespondedEvent, DisputeStatus, Error, ResolutionTarget,
 };
 use soroban_sdk::{token, Address, BytesN, Env, Symbol};
 
@@ -45,7 +45,7 @@ pub fn do_open_dispute(
 ) -> Result<u64, Error> {
     subscriber.require_auth();
 
-    // ── Checks ────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Checks ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     if amount <= 0 {
         return Err(Error::InvalidAmount);
     }
@@ -68,10 +68,10 @@ pub fn do_open_dispute(
     let token_addr = &sub.token;
     let merchant_balance = merchant::get_merchant_balance_by_token(env, &sub.merchant, token_addr);
     if merchant_balance < amount {
-        return Err(Error::InsufficientBalance);
+        return Err(Error::DisputeAmountExceedsMerchantBalance);
     }
 
-    // ── Effects (state mutations before external interactions) ────────────
+    // ΓöÇΓöÇ Effects (state mutations before external interactions) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     let dispute_id: u64 = next_dispute_id(env);
 
     // 1. Debit merchant balance
@@ -123,7 +123,9 @@ pub fn do_open_dispute(
             amount,
             evidence_hash,
             timestamp: now,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::DISPUTE_OPENED_EVENT_SCHEMA_VERSION,
+            token: sub.token.clone(),
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -143,14 +145,14 @@ pub fn do_respond_dispute(
 ) -> Result<(), Error> {
     admin::require_admin_auth(env, &admin)?;
 
-    // ── Checks ────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Checks ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     let mut dispute = read_dispute(env, dispute_id)?;
 
     if dispute.status != DisputeStatus::Open {
         return Err(Error::DisputeAlreadyResponded);
     }
 
-    // ── Effects ───────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Effects ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     dispute.status = DisputeStatus::Responded;
     dispute.responded_at = Some(env.ledger().timestamp());
     dispute.admin_evidence_hash = evidence_hash.clone();
@@ -159,6 +161,8 @@ pub fn do_respond_dispute(
         .persistent()
         .set(&DataKey::Dispute(dispute_id), &dispute);
 
+    let token = queries::get_subscription(env, dispute.subscription_id)?.token.clone();
+
     env.events().publish(
         (Symbol::new(env, "dispute_responded"), dispute_id),
         DisputeRespondedEvent {
@@ -166,7 +170,9 @@ pub fn do_respond_dispute(
             subscription_id: dispute.subscription_id,
             admin_evidence_hash: evidence_hash,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::DISPUTE_RESPONDED_EVENT_SCHEMA_VERSION,
+            token,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -180,10 +186,10 @@ pub fn do_respond_dispute(
 ///
 /// | Dispute status | Window elapsed | Resolution allowed |
 /// |:---|:---:|:---|
-/// | `Open` | No  | Rejected – admin must respond first (`DisputeNotResponded`) |
+/// | `Open` | No  | Rejected ΓÇô admin must respond first (`DisputeNotResponded`) |
 /// | `Open` | Yes | Resolved to **subscriber** (auto-resolve) |
 /// | `Responded` | Either | Admin may resolve to **subscriber** or **merchant** |
-/// | Resolved (any) | — | Rejected (`DisputeAlreadyResolved`) |
+/// | Resolved (any) | ΓÇö | Rejected (`DisputeAlreadyResolved`) |
 pub fn do_resolve_dispute(
     env: &Env,
     admin: Address,
@@ -192,7 +198,7 @@ pub fn do_resolve_dispute(
 ) -> Result<(), Error> {
     admin::require_admin_auth(env, &admin)?;
 
-    // ── Checks ────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Checks ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     let mut dispute = read_dispute(env, dispute_id)?;
 
     if dispute.status == DisputeStatus::ResolvedToMerchant
@@ -202,7 +208,8 @@ pub fn do_resolve_dispute(
     }
 
     let now = env.ledger().timestamp();
-    let window_elapsed = now.saturating_sub(dispute.opened_at) >= DISPUTE_WINDOW_SECS;
+    let window_elapsed = now.saturating_sub(dispute.opened_at)
+        >= admin::get_dispute_window_secs(env);
 
     if dispute.status == DisputeStatus::Open && !window_elapsed {
         // Admin must respond before the dispute can be resolved (merchant
@@ -220,7 +227,7 @@ pub fn do_resolve_dispute(
         DisputeStatus::ResolvedToMerchant
     };
 
-    // ── Read the escrow ledger ───────────────────────────────────────────
+    // ΓöÇΓöÇ Read the escrow ledger ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     let mut escrow_ledger: DisputeEscrowLedger = env
         .storage()
         .instance()
@@ -237,7 +244,7 @@ pub fn do_resolve_dispute(
         return Err(Error::InsufficientBalance);
     }
 
-    // ── Invariant: cumulative disbursement must never exceed original escrow ─
+    // ΓöÇΓöÇ Invariant: cumulative disbursement must never exceed original escrow ΓöÇ
     //
     // This check is a defense-in-depth guard against partial-resolution bugs
     // or future code changes that split escrow across multiple resolutions.
@@ -260,18 +267,18 @@ pub fn do_resolve_dispute(
     let sub = queries::get_subscription(env, dispute.subscription_id)?;
     let token_addr = &sub.token;
 
-    // ── Effects ───────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Effects ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     // Update the ledger so that future resolution attempts (if any) see the
     // updated disbursement and cannot overpay.
     escrow_ledger.total_disbursed = new_total_disbursed;
 
     if new_total_disbursed == escrow_ledger.original_amount {
-        // Fully disbursed — remove the escrow key
+        // Fully disbursed ΓÇö remove the escrow key
         env.storage()
             .instance()
             .remove(&DataKey::DisputeEscrow(dispute_id));
     } else {
-        // Partial disbursement — update the ledger
+        // Partial disbursement ΓÇö update the ledger
         env.storage()
             .instance()
             .set(&DataKey::DisputeEscrow(dispute_id), &escrow_ledger);
@@ -284,7 +291,7 @@ pub fn do_resolve_dispute(
         merchant::set_merchant_balance(env, &dispute.merchant, token_addr, &new_balance);
     } else {
         // Transfer escrowed funds to subscriber
-        // Funds leave vault custody — keep accounting consistent.
+        // Funds leave vault custody ΓÇö keep accounting consistent.
         crate::accounting::sub_total_accounted(env, token_addr, remaining)?;
 
         let token_client = token::Client::new(env, token_addr);
@@ -313,7 +320,14 @@ pub fn do_resolve_dispute(
             subscription_id: dispute.subscription_id,
             resolution,
             timestamp: now,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::DISPUTE_RESOLVED_EVENT_SCHEMA_VERSION,
+            resolved_to: if resolution == DisputeStatus::ResolvedToMerchant {
+                ResolutionTarget::Merchant
+            } else {
+                ResolutionTarget::Subscriber
+            },
+            token: token_addr.clone(),
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -340,14 +354,14 @@ pub fn do_get_subscription_dispute(env: &Env, subscription_id: u32) -> Option<u6
 /// [`Error::DisputeAlreadyOpen`].
 ///
 /// # Arguments
-/// * `subscriber` — Must match the escrow's subscriber address.
-/// * `subscription_id` — The subscription whose escrow to claim.
+/// * `subscriber` ΓÇö Must match the escrow's subscriber address.
+/// * `subscription_id` ΓÇö The subscription whose escrow to claim.
 ///
 /// # Errors
-/// * [`Error::EscrowNotFound`] — No escrow record for this subscription.
-/// * [`Error::Unauthorized`] — Caller does not match the escrow subscriber.
-/// * [`Error::EscrowNotReleased`] — The hold window has not elapsed yet.
-/// * [`Error::DisputeAlreadyOpen`] — A dispute exists for this subscription.
+/// * [`Error::EscrowNotFound`] ΓÇö No escrow record for this subscription.
+/// * [`Error::Unauthorized`] ΓÇö Caller does not match the escrow subscriber.
+/// * [`Error::EscrowNotReleased`] ΓÇö The hold window has not elapsed yet.
+/// * [`Error::DisputeAlreadyOpen`] ΓÇö A dispute exists for this subscription.
 ///
 /// # Events
 /// Emits [`CancellationEscrowReleasedEvent`].
@@ -367,6 +381,11 @@ pub fn do_claim_cancellation_escrow(
     if subscriber != escrow.subscriber {
         return Err(Error::Unauthorized);
     }
+
+    crate::subscription::extend_subscription_ttl(
+        env,
+        &DataKey::CancellationEscrow(subscription_id),
+    );
 
     let now = env.ledger().timestamp();
     if now < escrow.released_at {
@@ -403,7 +422,8 @@ pub fn do_claim_cancellation_escrow(
             subscriber: escrow.subscriber.clone(),
             amount: escrow.amount,
             timestamp: now,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -419,14 +439,14 @@ pub fn do_claim_cancellation_escrow(
 /// existing dispute-resolution lifecycle.
 ///
 /// # Arguments
-/// * `merchant` — Must match the escrow's merchant address.
-/// * `subscription_id` — The subscription whose escrow to dispute.
+/// * `merchant` ΓÇö Must match the escrow's merchant address.
+/// * `subscription_id` ΓÇö The subscription whose escrow to dispute.
 ///
 /// # Errors
-/// * [`Error::EscrowNotFound`] — No escrow record for this subscription.
-/// * [`Error::Unauthorized`] — Caller does not match the escrow merchant.
-/// * [`Error::EscrowNotReleased`] — The hold window has elapsed (cannot dispute).
-/// * [`Error::DisputeAlreadyOpen`] — A dispute already exists for this subscription.
+/// * [`Error::EscrowNotFound`] ΓÇö No escrow record for this subscription.
+/// * [`Error::Unauthorized`] ΓÇö Caller does not match the escrow merchant.
+/// * [`Error::EscrowNotReleased`] ΓÇö The hold window has elapsed (cannot dispute).
+/// * [`Error::DisputeAlreadyOpen`] ΓÇö A dispute already exists for this subscription.
 ///
 /// # Events
 /// Emits [`CancellationEscrowDisputedEvent`] and [`DisputeOpenedEvent`].
@@ -506,7 +526,8 @@ pub fn do_lodge_escrow_dispute(
             dispute_id,
             amount: escrow.amount,
             timestamp: now,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -521,7 +542,9 @@ pub fn do_lodge_escrow_dispute(
             amount: escrow.amount,
             evidence_hash: None,
             timestamp: now,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::DISPUTE_OPENED_EVENT_SCHEMA_VERSION,
+            token: escrow.token.clone(),
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -539,7 +562,7 @@ pub fn do_get_cancellation_escrow(
         .ok_or(Error::EscrowNotFound)
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// ΓöÇΓöÇ Internal helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 fn read_dispute(env: &Env, dispute_id: u64) -> Result<Dispute, Error> {
     env.storage()

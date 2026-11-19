@@ -152,11 +152,142 @@ Both are explicitly rejected:
 - `new_admin == current_admin` → `Error::SelfRotation`
 - `new_admin == env.current_contract_address()` → `Error::InvalidNewAdmin`
 
+## Two-Step Rotation and Rollback
+
+`rotate_admin` (above) is the **instant** path: one transaction, no
+confirmation step, no way back. For anything routine — key rotation, moving to
+a multisig, a planned handover — use the two-step flow instead, which puts a
+verifiable window between "I propose you" and "you become admin".
+
+### The two-step flow
+
+```rust
+// Step 1 — current admin proposes. Nonce-free; see "Nonce Protection".
+pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address)
+    -> Result<(), Error>;
+
+// Step 2a — the proposed admin claims, becoming the stored admin.
+pub fn claim_admin_role(env: Env, claimant: Address) -> Result<(), Error>;
+
+// Step 2b — the current admin cancels the proposal instead.
+pub fn cancel_admin_proposal(env: Env, admin: Address) -> Result<(), Error>;
+
+// Read the pending proposal (or `None`).
+pub fn get_admin_proposal(env: Env) -> Option<AdminProposal>;
+```
+
+`propose_admin` writes an `AdminProposal { new_admin, proposed_at, expires_at }`
+to **instance** storage with
+`expires_at = proposed_at + 7 days` (`PROPOSAL_WINDOW_SECS`). It emits
+`admin_proposal_created`.
+
+`claim_admin_role` can only succeed for the exact address in the proposal, and
+only after a 24-hour cooldown has elapsed since the proposal was created
+(`ADMIN_PROPOSAL_COOLDOWN_SECS`).
+
+| Step | Rejects with |
+|------|---------------|
+| `propose_admin` | `Unauthorized` (caller is not the stored admin), `InvalidNewAdmin` (`new_admin == contract address`), `ProposalAlreadyExists` (a proposal is already pending *and still inside its window* — an expired one is replaced) |
+| `claim_admin_role` | `ProposalNotFound`, `ProposalCooldownActive` (within 24 h of the proposal), `ProposalExpired` (also clears the stale proposal), `InvalidClaimant` (not the proposed address) |
+| `cancel_admin_proposal` | `Unauthorized` (caller is not the stored admin), `NoActiveProposal` (nothing pending) |
+
+Only one *claimable* proposal can exist at a time — a second `propose_admin`
+fails with `ProposalAlreadyExists` until the first is claimed, cancelled, or
+expires. An expired proposal is dead: it can never be claimed again, so
+`propose_admin` treats it as absent and overwrites it with a fresh proposal
+(and a fresh 7-day window) rather than returning `ProposalAlreadyExists`
+forever and forcing the admin to cancel first.
+
+The boundary is inclusive on the claim side: a proposal whose
+`expires_at == ledger.timestamp()` is still claimable, and it is only replaced
+once `ledger.timestamp() > expires_at`.
+
+### Rollback: the new admin key is compromised *before* acceptance
+
+**A rollback path is available. `cancel_admin_proposal` exists and is
+callable by the current admin at any time before the proposal is claimed.**
+
+This is the scenario the issue asks about, and it is fully recoverable:
+
+```
+1. propose_admin(current_admin, new_admin)        → admin_proposal_created
+   ... new_admin's key is compromised, or was mistyped,
+       or was never actually controlled by the intended party ...
+
+2. cancel_admin_proposal(current_admin)           → admin_proposal_cancelled
+   → the pending proposal is removed. Nothing else changes.
+   → current_admin remains the stored admin, unchanged.
+
+3. Re-propose correctly, or use rotate_admin if the window is not needed.
+```
+
+Properties that matter for an incident:
+
+- **No grace period, no race.** `claim_admin_role` requires a 24-hour cooldown
+  after the proposal was created. Cancelling well inside that window means the
+  new admin provably cannot have claimed, so the rollback is race-free. Verify
+  by reading `get_admin_proposal` before acting.
+- **Total no-op on everything else.** `cancel_admin_proposal` removes exactly
+  one instance-storage key and emits one event. It does not touch
+  `DataKey::Admin`, subscriptions, balances, nonces, or any other config.
+- **Admin authority is never lost.** Only the *stored* admin may cancel
+  (`Unauthorized` otherwise), and cancelling does not change who that is. The
+  current admin retains full authority throughout.
+- **Repeatable.** After cancelling, `propose_admin` succeeds again immediately
+  — there is no cooldown on the propose/cancel pair.
+- **No nonce consumed.** Unlike `rotate_admin`, neither `propose_admin` nor
+  `cancel_admin_proposal` uses the admin nonce (domain 1), so cancelling
+  cannot be blocked by a stale nonce and does not consume one.
+
+⚠ **The window is not infinite.** If the 24-hour cooldown has already elapsed
+*and* the new admin has already called `claim_admin_role`, the rollback is
+gone — see [Rollback after acceptance](#rollback-after-acceptance) below.
+**Cancel early.** Treat the cooldown as the deadline, not the 7-day expiry.
+
+### Emergency stop interaction
+
+All admin-transfer paths (`rotate_admin`, `propose_admin`, and
+`claim_admin_role`) return `Error::EmergencyStopActive` while the emergency
+stop is active. This prevents a pending or newly created transfer from
+changing administrative control during an incident. The current admin may
+still call `cancel_admin_proposal` to revoke a pending transfer.
+
+After the incident is resolved and the stop has been disabled, use
+`rotate_admin` when an immediate handoff is necessary or the stored admin is a
+contract/governance address that cannot use the two-step flow.
+
+`rotate_admin` **is** nonce-gated (`DOMAIN_ADMIN_ROTATION`, read with
+`get_admin_nonce(current_admin, 1)`), so query the nonce immediately before
+signing.
+
+### Rollback after acceptance
+
+Once `claim_admin_role` has succeeded there is **no rollback**. The stored
+admin is now the new admin, and the old admin's address returns
+`Error::Unauthorized` on every admin-only entrypoint. The only recovery is the
+new admin voluntarily proposing/rotating back.
+
+This is the irreducible risk of the two-step flow, and it is why:
+
+- The new admin should be a **multisig or governance address**.
+- The old admin should independently confirm the new admin can actually sign
+  (and can actually sign a *rejection*) before proposing.
+- Cancellation should be treated as a normal, cheap operation — not an
+  admission of failure.
+
+For the full operational procedure, including the per-step CLI invocations and
+error-code table, see [`runbooks/admin_rotation.md`](runbooks/admin_rotation.md)
+→ *Step 3B: Cancel* and *§4 Rollback Path*.
+
 ## Access Control Matrix
 
 | Operation | Current Admin | Previous Admin | Non-Admin |
 |-----------|:---:|:---:|:---:|
 | `rotate_admin` | ✓ | ✗ `Unauthorized` | ✗ `Unauthorized` |
+| `propose_admin` | ✓ | ✗ `Unauthorized` | ✗ `Unauthorized` |
+| `cancel_admin_proposal` | ✓ | ✗ `Unauthorized` | ✗ `Unauthorized` |
+| `claim_admin_role` | ✗ (must be the *proposed* address) | ✗ `InvalidClaimant` | ✗ `InvalidClaimant` |
+| `get_admin_proposal` | ✓ (read-only, no auth) | ✓ | ✓ |
 | `set_min_topup` | ✓ | ✗ `Unauthorized` | ✗ `Unauthorized` |
 | `set_grace_period` | ✓ | ✗ `Unauthorized` | ✗ `Unauthorized` |
 | `add_accepted_token` | ✓ | ✗ `Unauthorized` | ✗ `Unauthorized` |
@@ -168,12 +299,6 @@ Both are explicitly rejected:
 | `batch_charge` | ✓ (via stored auth) | ✗ | ✗ |
 | `charge_subscription` | ✓ (via stored auth) | ✗ | ✗ |
 | `charge_usage` | ✓ (via stored auth) | ✗ | ✗ |
-
-### Emergency Stop Interaction
-
-`rotate_admin` is **not** gated by the emergency stop. This is intentional:
-rotation is the primary mechanism for handing off control during an incident.
-After rotation, the new admin can `disable_emergency_stop` to resume operations.
 
 ## Security Notes
 

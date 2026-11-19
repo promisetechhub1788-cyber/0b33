@@ -89,10 +89,10 @@ pub fn do_set_metadata_signed(
     // resolve.
     let sub = get_subscription(env, payload.subscription_id)?;
 
-    // Validate key/value lengths before building the message — avoids
+    // Validate key/value lengths and key quota before building the message — avoids
     // panicking in build_metadata_signed_message if the payload is
-    // over-length, and returns a clean error instead.
-    apply_metadata_value(env, payload.subscription_id, &payload.key, &payload.value)?;
+    // over-length or over-capacity, and returns a clean error without mutating storage.
+    validate_metadata_input(env, payload.subscription_id, &payload.key, &payload.value)?;
 
     // Build the canonical message and verify the ed25519 signature against
     // the supplied pubkey. Verification hashes the message internally per
@@ -124,10 +124,10 @@ pub fn do_set_metadata_signed(
         return Err(Error::Forbidden);
     }
 
-    // Reject stale payloads. Strict inequality (`> =`) means an exactly-
+    // Reject stale payloads. Strict inequality (`>=`) means an exactly-
     // expired payload is rejected deterministically without an off-by-one
     // hazard. A generously future-dated `expires_at` (e.g. now + one
-    // interval) is the recommeded setting.
+    // interval) is the recommended setting.
     let now = env.ledger().timestamp();
     if now >= payload.expires_at {
         return Err(Error::InvalidInput);
@@ -143,6 +143,9 @@ pub fn do_set_metadata_signed(
         payload.nonce,
     )?;
 
+    // Commit storage update only after all authentication, expiration, and nonce checks pass.
+    apply_metadata_storage(env, payload.subscription_id, &payload.key, &payload.value);
+
     env.events().publish(
         (
             Symbol::new(env, "metadata_set_signed"),
@@ -154,7 +157,8 @@ pub fn do_set_metadata_signed(
             signer: signer_address,
             nonce: payload.nonce,
             timestamp: now,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -242,15 +246,29 @@ pub fn build_metadata_signed_message(
     buf
 }
 
-/// Shared inner helper for the on-chain and signed entrypoints.
+/// Validate metadata key, value, and key quota without modifying contract storage.
 ///
-/// Both [`set_metadata`] (after auth) and [`do_set_metadata_signed`] (after
-/// signature + nonce checks) end up here: validate key/value lengths, ensure
-/// the per-subscription key cap, write the storage entry, and return.
+/// Ensures key and value length constraints, UTF-8 validity, and that adding
+/// a new key will not exceed [`MAX_METADATA_KEYS`].
 ///
-/// Split out so the validation/storage/error contract is identical and any
-/// future invariant change touches one place.
-fn apply_metadata_value(
+/// # Insert vs. update (Issue #476)
+///
+/// The key-count limit (`MAX_METADATA_KEYS`) is only enforced for **new**
+/// keys. Updating an existing key — one already present in
+/// `DataKey::MetadataKeys(subscription_id)` — does **not** consume a new
+/// slot and must always succeed (provided the value passes length/UTF-8
+/// validation). This is checked by testing `key_exists` before comparing
+/// `keys.len() >= MAX_METADATA_KEYS`: if the key already exists the limit
+/// is skipped entirely.
+///
+/// # Length limits are byte-based (Issue #304)
+///
+/// `MAX_METADATA_KEY_LENGTH` and `MAX_METADATA_VALUE_LENGTH` are enforced on
+/// the raw UTF-8 encoded byte length (`String::len()`), **not** on the number
+/// of visible characters. A multi-byte character (e.g. CJK, emoji) counts as
+/// multiple bytes toward the limit, so a key of at most 32 bytes may contain
+/// fewer than 32 characters.
+pub fn validate_metadata_input(
     env: &Env,
     subscription_id: u32,
     key: &String,
@@ -264,6 +282,32 @@ fn apply_metadata_value(
         return Err(Error::MetadataValueTooLong);
     }
 
+    // UTF-8 validation for key and value to prevent corruption of off-chain indexers
+    // that parse event payloads as UTF-8. soroban_sdk::String should contain valid UTF-8,
+    // but we validate explicitly to ensure data integrity.
+    validate_utf8_string(key, "metadata key")?;
+    validate_utf8_string(value, "metadata value")?;
+
+    let keys: Vec<String> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::MetadataKeys(subscription_id))
+        .unwrap_or(Vec::new(env));
+
+    let key_exists = keys.iter().any(|k| k == *key);
+
+    if !key_exists && keys.len() >= MAX_METADATA_KEYS {
+        return Err(Error::MetadataKeyLimitReached);
+    }
+
+    Ok(())
+}
+
+/// Commit metadata key and value into persistent storage.
+///
+/// Assumes [`validate_metadata_input`] has already validated lengths, UTF-8,
+/// and key quota.
+pub fn apply_metadata_storage(env: &Env, subscription_id: u32, key: &String, value: &String) {
     let mut keys: Vec<String> = env
         .storage()
         .persistent()
@@ -273,9 +317,6 @@ fn apply_metadata_value(
     let key_exists = keys.iter().any(|k| k == *key);
 
     if !key_exists {
-        if keys.len() >= MAX_METADATA_KEYS {
-            return Err(Error::MetadataKeyLimitReached);
-        }
         keys.push_back(key.clone());
         env.storage()
             .persistent()
@@ -285,7 +326,19 @@ fn apply_metadata_value(
     env.storage()
         .persistent()
         .set(&DataKey::Metadata(subscription_id, key.clone()), value);
+}
 
+/// Shared inner helper for the on-chain entrypoint.
+///
+/// Validates key/value lengths and key quota, writes the storage entry, and returns.
+pub fn apply_metadata_value(
+    env: &Env,
+    subscription_id: u32,
+    key: &String,
+    value: &String,
+) -> Result<(), Error> {
+    validate_metadata_input(env, subscription_id, key, value)?;
+    apply_metadata_storage(env, subscription_id, key, value);
     Ok(())
 }
 
@@ -311,7 +364,8 @@ pub fn set_metadata(
             subscription_id,
             key,
             authorizer: caller.clone(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -363,7 +417,8 @@ pub fn delete_metadata(
                 subscription_id,
                 key,
                 authorizer: caller.clone(),
-                schema_version: crate::types::EVENT_SCHEMA_VERSION,
+                schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+                contract_id: env.current_contract_address(),
             },
         );
     }
@@ -381,6 +436,181 @@ pub fn list_metadata_keys(env: &Env, subscription_id: u32) -> Result<Vec<String>
         .unwrap_or(Vec::new(env));
 
     Ok(keys)
+}
+
+/// Validates that a soroban_sdk::String contains valid UTF-8 byte sequences.
+///
+/// While soroban_sdk::String should theoretically contain valid UTF-8, this explicit
+/// validation prevents malformed byte sequences from corrupting off-chain indexers
+/// that parse event payloads as UTF-8.
+///
+/// # Arguments
+/// * `s` - The string to validate
+/// * `field_name` - Human-readable field name for error context
+///
+/// # Errors
+/// * `Error::InvalidInput` - If the string contains invalid UTF-8 sequences
+fn validate_utf8_string(s: &String, _field_name: &str) -> Result<(), Error> {
+    // Reject empty strings up front.
+    if s.len() == 0 {
+        return Err(Error::InvalidInput);
+    }
+
+    // Validate the raw bytes with Rust's standard UTF-8 decoder (issue #149 /
+    // #189) rather than a manual byte-range check, so valid multi-byte
+    // sequences (CJK, emoji, accented Latin, ...) are accepted.
+    let len = s.len() as usize;
+    let mut raw = vec![0u8; len];
+    s.copy_into_slice(&mut raw);
+    let text = core::str::from_utf8(&raw).map_err(|_| Error::InvalidInput)?;
+
+    // Reject null bytes (issue #300). `\0` is valid UTF-8 but terminates
+    // C-style strings in downstream systems, silently truncating values.
+    // The allowed character set is: any valid UTF-8 sequence that contains
+    // no NUL byte, no control characters other than tab (0x09), newline
+    // (0x0A), and carriage return (0x0D), and at least one printable
+    // (>= 0x20) non-whitespace character.
+    if text.bytes().any(|byte| byte == 0) {
+        return Err(Error::InvalidInput);
+    }
+
+    // Reject control characters (except tab/newline/CR) and require at least
+    // one printable, non-whitespace character.
+    let mut has_non_control_char = false;
+    for byte in text.bytes() {
+        if byte < 32 && byte != 9 && byte != 10 && byte != 13 {
+            return Err(Error::InvalidInput);
+        }
+        if byte >= 32 {
+            has_non_control_char = true;
+        }
+    }
+    if !has_non_control_char {
+        return Err(Error::InvalidInput);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod utf8_validation_tests {
+    use super::*;
+    use soroban_sdk::{Env, String};
+
+    #[test]
+    fn accepts_cjk_metadata_values() {
+        let env = Env::default();
+        let value = String::from_str(&env, "日本語のマーチャント名");
+        assert!(validate_utf8_string(&value, "metadata value").is_ok());
+    }
+
+    #[test]
+    fn accepts_accented_and_emoji_values() {
+        let env = Env::default();
+        let value = String::from_str(&env, "héllo wørld 🚀");
+        assert!(validate_utf8_string(&value, "metadata value").is_ok());
+    }
+
+    #[test]
+    fn accepts_cjk_metadata_keys() {
+        let env = Env::default();
+        let key = String::from_str(&env, "名前");
+        assert!(validate_utf8_string(&key, "metadata key").is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_values() {
+        let env = Env::default();
+        let empty = String::from_str(&env, "");
+        assert!(validate_utf8_string(&empty, "metadata value").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_only_values() {
+        let env = Env::default();
+        let spaces = String::from_str(&env, "   ");
+        assert!(validate_utf8_string(&spaces, "metadata value").is_err());
+    }
+
+    #[test]
+    fn rejects_null_bytes_in_values() {
+        let env = Env::default();
+        let value = String::from_str(&env, "abc\0def");
+        assert!(validate_utf8_string(&value, "metadata value").is_err());
+    }
+
+    #[test]
+    fn rejects_null_bytes_in_keys() {
+        let env = Env::default();
+        let key = String::from_str(&env, "key\0name");
+        assert!(validate_utf8_string(&key, "metadata key").is_err());
+    }
+}
+
+#[cfg(test)]
+mod metadata_key_length_tests {
+    use super::*;
+    use soroban_sdk::{Env, String};
+
+    /// A 32-byte ASCII key is exactly at the limit and must be accepted.
+    #[test]
+    fn accepts_ascii_key_at_byte_limit() {
+        let env = Env::default();
+        let key = String::from_str(&env, "01234567890123456789012345678901");
+        assert_eq!(key.len(), MAX_METADATA_KEY_LENGTH);
+        assert!(validate_metadata_input(&env, 1, &key, &String::from_str(&env, "v")).is_ok());
+    }
+
+    /// A 33-byte ASCII key exceeds the limit and must be rejected.
+    #[test]
+    fn rejects_ascii_key_over_byte_limit() {
+        let env = Env::default();
+        let key = String::from_str(&env, "012345678901234567890123456789012");
+        assert_eq!(key.len(), MAX_METADATA_KEY_LENGTH + 1);
+        assert_eq!(
+            validate_metadata_input(&env, 1, &key, &String::from_str(&env, "v")),
+            Err(Error::MetadataKeyTooLong)
+        );
+    }
+
+    /// A multi-byte key whose UTF-8 byte length is exactly at the limit is
+    /// accepted, even though it has fewer than 32 visible characters.
+    #[test]
+    fn accepts_multibyte_key_at_byte_limit() {
+        let env = Env::default();
+        // Each CJK character is 3 bytes in UTF-8; 10 chars = 30 bytes, plus
+        // one 2-byte character ("é") = 32 bytes total.
+        let key = String::from_str(&env, "日本語日本語日本é");
+        assert_eq!(key.len(), MAX_METADATA_KEY_LENGTH);
+        assert!(validate_metadata_input(&env, 1, &key, &String::from_str(&env, "v")).is_ok());
+    }
+
+    /// A multi-byte key whose UTF-8 byte length exceeds the limit is rejected
+    /// even though its character count is well under 32.
+    #[test]
+    fn rejects_multibyte_key_over_byte_limit() {
+        let env = Env::default();
+        // 11 CJK characters = 33 bytes, but only 11 visible characters.
+        let key = String::from_str(&env, "日本語日本語日本語");
+        assert_eq!(key.len(), MAX_METADATA_KEY_LENGTH + 1);
+        assert_eq!(
+            validate_metadata_input(&env, 1, &key, &String::from_str(&env, "v")),
+            Err(Error::MetadataKeyTooLong)
+        );
+    }
+
+    /// An emoji key (4 bytes per code point) is enforced on bytes, not chars.
+    #[test]
+    fn rejects_emoji_key_over_byte_limit() {
+        let env = Env::default();
+        // 9 emoji = 36 bytes, but only 9 visible characters.
+        let key = String::from_str(&env, "🚀🚀🚀🚀🚀🚀🚀🚀🚀");
+        assert_eq!(key.len(), 36);
+        assert_eq!(
+            validate_metadata_input(&env, 1, &key, &String::from_str(&env, "v")),
+            Err(Error::MetadataKeyTooLong)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -509,5 +739,101 @@ mod signed_message_tests {
     fn smoke_helper_module_compiles() {
         let env = Env::default();
         let _ = env;
+    }
+}
+
+#[cfg(test)]
+mod metadata_limit_ordering_tests {
+    use super::*;
+    use crate::types::DataKey;
+    use soroban_sdk::{Env, String, Vec};
+
+    #[test]
+    fn metadata_key_limit_checked_before_storage_mutation() {
+        let env = Env::default();
+        let sub_id = 42u32;
+
+        // Pre-fill MAX_METADATA_KEYS into storage
+        let mut keys = Vec::new(&env);
+        for n in 0..MAX_METADATA_KEYS {
+            let k = String::from_str(&env, &format!("key_{}", n));
+            let v = String::from_str(&env, &format!("val_{}", n));
+            keys.push_back(k.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Metadata(sub_id, k), &v);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MetadataKeys(sub_id), &keys);
+
+        // Attempt to validate/insert an 11th distinct key
+        let new_key = String::from_str(&env, "key_overflow");
+        let new_val = String::from_str(&env, "val_overflow");
+
+        let res = apply_metadata_value(&env, sub_id, &new_key, &new_val);
+        assert_eq!(res, Err(Error::MetadataKeyLimitReached));
+
+        // Storage MUST be completely unchanged:
+        // 1. New key must not exist in MetadataKeys list
+        let stored_keys: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MetadataKeys(sub_id))
+            .unwrap();
+        assert_eq!(stored_keys.len(), MAX_METADATA_KEYS);
+        assert!(!stored_keys.iter().any(|k| k == new_key));
+
+        // 2. New key must not exist in DataKey::Metadata
+        let stored_val: Option<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Metadata(sub_id, new_key.clone()));
+        assert_eq!(stored_val, None);
+
+        // 3. All original keys and values remain intact
+        for n in 0..MAX_METADATA_KEYS {
+            let k = String::from_str(&env, &format!("key_{}", n));
+            let expected_v = String::from_str(&env, &format!("val_{}", n));
+            let actual_v: String = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Metadata(sub_id, k))
+                .unwrap();
+            assert_eq!(actual_v, expected_v);
+        }
+    }
+
+    #[test]
+    fn metadata_update_existing_key_at_limit_does_not_fail() {
+        let env = Env::default();
+        let sub_id = 42u32;
+
+        let mut keys = Vec::new(&env);
+        for n in 0..MAX_METADATA_KEYS {
+            let k = String::from_str(&env, &format!("key_{}", n));
+            let v = String::from_str(&env, "old");
+            keys.push_back(k.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Metadata(sub_id, k), &v);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MetadataKeys(sub_id), &keys);
+
+        // Updating an existing key at capacity must succeed and update storage
+        let key_0 = String::from_str(&env, "key_0");
+        let new_val = String::from_str(&env, "new_val");
+
+        let res = apply_metadata_value(&env, sub_id, &key_0, &new_val);
+        assert!(res.is_ok());
+
+        let actual_v: String = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Metadata(sub_id, key_0))
+            .unwrap();
+        assert_eq!(actual_v, new_val);
     }
 }
